@@ -1,0 +1,681 @@
+From 799f98cd665ac29c26bb6ddbaf08cd9de4b1e06a Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 25 Nov 2026 21:44:33 +0000
+Subject: [PATCH] Add LAN room discovery for automatic network game discovery
+
+- Implement LanRoomDiscoveryService for UDP broadcast-based room discovery
+- Hosts broadcast room info every 2 seconds on port 33770
+- Clients listen for broadcasts and display discovered rooms
+- Add discovered rooms list to join screen UI
+- Auto-fill IP:port when clicking a discovered room
+- Acquire/release Android MulticastLock for receiving broadcasts
+- Add lan_room_discovery_enabled setting (default: true)
+- Keep manual IP entry as fallback option
+---
+ .../Patches/AndroidInGameSettingsPatches.cs   |   1 +
+ .../Patches/AndroidSettingsMerge.cs           |   1 +
+ .../Patches/LanMultiplayerPatches.cs          | 213 ++++++++++-
+ .../Patches/LanRoomDiscoveryService.cs        | 343 ++++++++++++++++++
+ 4 files changed, 551 insertions(+), 7 deletions(-)
+ create mode 100644 STS2AndroidPortCompat/Patches/LanRoomDiscoveryService.cs
+
+diff --git a/STS2AndroidPortCompat/Patches/AndroidInGameSettingsPatches.cs b/STS2AndroidPortCompat/Patches/AndroidInGameSettingsPatches.cs
+index 82f1239..83fc0bf 100644
+--- a/STS2AndroidPortCompat/Patches/AndroidInGameSettingsPatches.cs
++++ b/STS2AndroidPortCompat/Patches/AndroidInGameSettingsPatches.cs
+@@ -309,6 +309,7 @@ public static class AndroidInGameSettingsPatches
+         AddSwitchRow(content, "max_multiplayer_enabled", T("启用实验性自定义最大联机人数", "Enable experimental custom max players"), true, null);
+         AddIntPaginatorRow(content, "max_multiplayer_players", T("实验性最大联机人数", "Experimental max players"), Range(1, 128, 1), 4, v => v.ToString(), null);
+         AddSwitchRow(content, "lan_multiplayer_enabled", T("本地联机补丁", "Local multiplayer patch"), true, null);
++        AddSwitchRow(content, "lan_room_discovery_enabled", T("LAN 房间自动发现", "LAN room discovery"), true, null);
+         AddTextRow(content, "lan_custom_player_id", T("LAN 自定义玩家 ID", "LAN custom player ID"), "", null);
+     }
+ 
+diff --git a/STS2AndroidPortCompat/Patches/AndroidSettingsMerge.cs b/STS2AndroidPortCompat/Patches/AndroidSettingsMerge.cs
+index 68fa81f..e547d57 100644
+--- a/STS2AndroidPortCompat/Patches/AndroidSettingsMerge.cs
++++ b/STS2AndroidPortCompat/Patches/AndroidSettingsMerge.cs
+@@ -45,6 +45,7 @@ public static class AndroidSettingsMerge
+         "mobile_tooltip_long_press_ms",
+         "show_mobile_emoji_button",
+         "lan_multiplayer_enabled",
++        "lan_room_discovery_enabled",
+         "max_multiplayer_players",
+         "max_multiplayer_enabled",
+         "quick_sl_enabled",
+diff --git a/STS2AndroidPortCompat/Patches/LanMultiplayerPatches.cs b/STS2AndroidPortCompat/Patches/LanMultiplayerPatches.cs
+index ec3f3a0..71be753 100644
+--- a/STS2AndroidPortCompat/Patches/LanMultiplayerPatches.cs
++++ b/STS2AndroidPortCompat/Patches/LanMultiplayerPatches.cs
+@@ -48,6 +48,7 @@ public static class LanMultiplayerPatches
+     private const string LanMultiplayerSavePlayerIdSettingKey = "lan_multiplayer_save_player_id";
+ 
+     private static readonly Dictionary<PlatformType, Dictionary<ulong, string>> PlayerNameOverrides = new();
++    private static LanRoomDiscoveryService _discoveryService;
+ 
+     public static void Apply(Harmony harmony)
+     {
+@@ -201,10 +202,12 @@ public static class LanMultiplayerPatches
+             if (loadingOverlay != null)
+                 loadingOverlay.Visible = false;
+             ConfigureLanJoinScreen(__instance);
++            StartRoomDiscovery(__instance);
+         }
+         catch (Exception exception)
+         {
+             PatchHelper.Log($"LAN join screen patch failed, falling back to original: {exception}");
++            StopRoomDiscovery();
+             return true;
+         }
+         return false;
+@@ -222,6 +225,7 @@ public static class LanMultiplayerPatches
+     {
+         try
+         {
++            StopRoomDiscovery();
+             var currentJoinFlow = AccessTools.Field(__instance.GetType(), "_currentJoinFlow")?.GetValue(__instance);
+             var cancelToken = currentJoinFlow?.GetType().GetProperty("CancelToken")?.GetValue(currentJoinFlow);
+             cancelToken?.GetType().GetMethod("Cancel", Type.EmptyTypes)?.Invoke(cancelToken, null);
+@@ -683,21 +687,49 @@ public static class LanMultiplayerPatches
+             AnchorTop = 0.5f,
+             AnchorRight = 0.5f,
+             AnchorBottom = 0.5f,
+-            OffsetLeft = -332,
+-            OffsetTop = -8,
+-            OffsetRight = 332,
+-            OffsetBottom = 202,
++            OffsetLeft = -400,
++            OffsetTop = -250,
++            OffsetRight = 400,
++            OffsetBottom = 250,
+             GrowHorizontal = Control.GrowDirection.Both,
+             GrowVertical = Control.GrowDirection.Both,
+         };
+         container.AddThemeConstantOverride("separation", 18);
+ 
+-        var help = MakeMegaLabel("LanHelpLabel", T("输入房主局域网 IP 和端口加入。", "Join the host by entering their LAN IP and port."), 26, Colors.White);
+-        help.CustomMinimumSize = new Vector2(0, 72);
++        var help = MakeMegaLabel("LanHelpLabel", T("选择下面的房间或手动输入 IP:端口", "Select a room below or enter IP:port manually"), 26, Colors.White);
++        help.CustomMinimumSize = new Vector2(0, 48);
+         help.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+         container.AddChild(help);
++
++        // Discovered rooms section
++        var roomsLabel = MakeMegaLabel("RoomsLabel", T("发现的房间", "Discovered Rooms"), 24, new Color(0.937255f, 0.784314f, 0.317647f));
++        container.AddChild(roomsLabel);
++
++        var scrollContainer = new ScrollContainer
++        {
++            CustomMinimumSize = new Vector2(0, 180),
++            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
++            SizeFlagsVertical = Control.SizeFlags.ExpandFill
++        };
++
++        var roomsList = new VBoxContainer
++        {
++            Name = "DiscoveredRoomsList",
++            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill
++        };
++        roomsList.AddThemeConstantOverride("separation", 8);
++
++        scrollContainer.AddChild(roomsList);
++        container.AddChild(scrollContainer);
++
++        // Manual entry section
++        var manualLabel = MakeMegaLabel("ManualEntryLabel", T("或手动输入", "Or Enter Manually"), 24, new Color(0.937255f, 0.784314f, 0.317647f));
++        manualLabel.AddThemeConstantOverride("outline_size", 0);
++        container.AddChild(manualLabel);
++
+         container.AddChild(MakeInputRow("LanHostRow", "LanHostLabel", T("房主 IP", "Host IP"), "LanHostInput", false));
+         container.AddChild(MakeInputRow("LanPortRow", "LanPortLabel", T("端口", "Port"), "LanPortInput", true));
++        
+         panel.AddChild(container);
+         AndroidFontCoveragePatches.RegisterTreePostfix(container);
+         return container;
+@@ -797,6 +829,10 @@ public static class LanMultiplayerPatches
+             var error = netService.StartENetHost(DefaultPort, hostCapacity);
+             if (!error.HasValue)
+             {
++                // Start broadcasting the room for LAN discovery
++                var gameModeStr = gameMode.ToString();
++                StartHostBroadcast(DefaultPort, 1, hostCapacity, gameModeStr);
++
+ #if STS2_TARGET_1130
+                 if (isCustom)
+                 {
+@@ -875,6 +911,10 @@ public static class LanMultiplayerPatches
+             if (!error.HasValue)
+             {
+                 var gameMode = GetRunGameMode(run);
++                
++                // Start broadcasting the room for LAN discovery
++                StartHostBroadcast(DefaultPort, run.Players.Count, hostCapacity, gameMode.ToString());
++
+ #if STS2_TARGET_1130
+                 var isCustom = run.IsCustomGame;
+ #else
+@@ -945,7 +985,7 @@ public static class LanMultiplayerPatches
+         return builder.ToString().TrimEnd();
+     }
+ 
+-    private static IEnumerable<string> GetLocalIpv4Addresses()
++    public static IEnumerable<string> GetLocalIpv4Addresses()
+     {
+         var ips = new HashSet<string>(StringComparer.Ordinal);
+         try
+@@ -1011,4 +1051,163 @@ public static class LanMultiplayerPatches
+         if (popup != null)
+             NModalContainer.Instance.Add(popup);
+     }
++
++    private static void StartRoomDiscovery(NJoinFriendScreen screen)
++    {
++        try
++        {
++            if (!AndroidSettingsBridge.GetBool("lan_room_discovery_enabled", true))
++            {
++                PatchHelper.Log("LAN room discovery disabled in settings");
++                return;
++            }
++
++            StopRoomDiscovery();
++            _discoveryService = new LanRoomDiscoveryService();
++            _discoveryService.StartListening();
++            
++            // Start periodic UI refresh
++            TaskHelper.RunSafely(RefreshDiscoveredRoomsLoop(screen));
++        }
++        catch (Exception ex)
++        {
++            PatchHelper.Log($"Failed to start room discovery: {ex}");
++        }
++    }
++
++    private static void StopRoomDiscovery()
++    {
++        try
++        {
++            _discoveryService?.Dispose();
++            _discoveryService = null;
++        }
++        catch (Exception ex)
++        {
++            PatchHelper.Log($"Error stopping room discovery: {ex}");
++        }
++    }
++
++    private static async Task RefreshDiscoveredRoomsLoop(NJoinFriendScreen screen)
++    {
++        try
++        {
++            while (_discoveryService != null && Node.IsInstanceValid(screen) && screen.Visible)
++            {
++                UpdateDiscoveredRoomsList(screen);
++                await Task.Delay(1000);
++            }
++        }
++        catch
++        {
++            // Screen was disposed or task was cancelled
++        }
++    }
++
++    private static void UpdateDiscoveredRoomsList(NJoinFriendScreen screen)
++    {
++        try
++        {
++            if (_discoveryService == null)
++                return;
++
++            var panel = screen.GetNode<Control>("Panel");
++            var container = panel.GetNodeOrNull<VBoxContainer>("LanJoinContainer");
++            if (container == null)
++                return;
++
++            var roomListContainer = container.GetNodeOrNull<VBoxContainer>("DiscoveredRoomsList");
++            if (roomListContainer == null)
++                return;
++
++            // Clear existing room buttons
++            foreach (var child in roomListContainer.GetChildren())
++            {
++                if (child is Button)
++                    child.QueueFree();
++            }
++
++            var rooms = _discoveryService.GetDiscoveredRooms();
++            if (rooms.Count == 0)
++            {
++                var noRoomsLabel = roomListContainer.GetNodeOrNull<Label>("NoRoomsLabel");
++                if (noRoomsLabel == null)
++                {
++                    noRoomsLabel = new Label
++                    {
++                        Name = "NoRoomsLabel",
++                        Text = T("正在搜索局域网房间...", "Searching for LAN rooms..."),
++                        HorizontalAlignment = HorizontalAlignment.Center
++                    };
++                    noRoomsLabel.AddThemeColorOverride("font_color", new Color(0.7f, 0.7f, 0.7f));
++                    noRoomsLabel.AddThemeFontSizeOverride("font_size", 20);
++                    roomListContainer.AddChild(noRoomsLabel);
++                }
++            }
++            else
++            {
++                roomListContainer.GetNodeOrNull<Label>("NoRoomsLabel")?.QueueFree();
++
++                foreach (var room in rooms)
++                {
++                    var button = CreateRoomButton(screen, room);
++                    roomListContainer.AddChild(button);
++                }
++            }
++        }
++        catch (Exception ex)
++        {
++            PatchHelper.Log($"Error updating discovered rooms list: {ex}");
++        }
++    }
++
++    private static Button CreateRoomButton(NJoinFriendScreen screen, LanRoomDiscoveryService.RoomInfo room)
++    {
++        var button = new Button
++        {
++            CustomMinimumSize = new Vector2(0, 60),
++            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill
++        };
++
++        var playerInfo = $"{room.CurrentPlayers}/{room.MaxPlayers}";
++        var buttonText = $"{room.HostName} ({room.GameMode}) - {playerInfo}\n{room.HostIpAddress}:{room.GamePort}";
++        button.Text = buttonText;
++        button.AddThemeFontSizeOverride("font_size", 20);
++
++        button.Connect(Button.SignalName.Pressed, Callable.From(() =>
++        {
++            try
++            {
++                if (TryGetLanInputs(screen, out var hostInput, out var portInput))
++                {
++                    hostInput.Text = room.HostIpAddress;
++                    portInput.Text = room.GamePort.ToString();
++                }
++            }
++            catch (Exception ex)
++            {
++                PatchHelper.Log($"Error selecting discovered room: {ex}");
++            }
++        }));
++
++        return button;
++    }
++
++    private static void StartHostBroadcast(ushort port, int currentPlayers, int maxPlayers, string gameMode)
++    {
++        try
++        {
++            if (!AndroidSettingsBridge.GetBool("lan_room_discovery_enabled", true))
++                return;
++
++            StopRoomDiscovery();
++            _discoveryService = new LanRoomDiscoveryService();
++            _discoveryService.StartBroadcasting(port, currentPlayers, maxPlayers, gameMode);
++            PatchHelper.Log($"Started broadcasting LAN room on port {port}");
++        }
++        catch (Exception ex)
++        {
++            PatchHelper.Log($"Failed to start room broadcast: {ex}");
++        }
++    }
+ }
+diff --git a/STS2AndroidPortCompat/Patches/LanRoomDiscoveryService.cs b/STS2AndroidPortCompat/Patches/LanRoomDiscoveryService.cs
+new file mode 100644
+index 0000000..02e7d7d
+--- /dev/null
++++ b/STS2AndroidPortCompat/Patches/LanRoomDiscoveryService.cs
+@@ -0,0 +1,343 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Net;
++using System.Net.Sockets;
++using System.Text;
++using System.Text.Json;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace STS2Mobile.Patches;
++
++/// <summary>
++/// Provides LAN room discovery via UDP broadcast for Android multiplayer.
++/// Hosts periodically broadcast their room information, and clients listen
++/// for these broadcasts to discover available rooms on the local network.
++/// </summary>
++public class LanRoomDiscoveryService : IDisposable
++{
++    private const int DiscoveryPort = 33770; // One below the game port
++    private const int BroadcastIntervalMs = 2000;
++    private const int RoomTimeoutMs = 10000;
++    private const string DiscoveryMagic = "STS2LANROOM";
++    
++    private UdpClient _broadcastClient;
++    private UdpClient _listenerClient;
++    private CancellationTokenSource _cancellationSource;
++    private Task _broadcastTask;
++    private Task _listenerTask;
++    private readonly object _roomsLock = new object();
++    private readonly Dictionary<string, DiscoveredRoom> _discoveredRooms = new Dictionary<string, DiscoveredRoom>();
++    private Java.Lang.Object _multicastLock;
++
++    public class RoomInfo
++    {
++        public string HostName { get; set; }
++        public string HostIpAddress { get; set; }
++        public ushort GamePort { get; set; }
++        public int CurrentPlayers { get; set; }
++        public int MaxPlayers { get; set; }
++        public string GameMode { get; set; }
++        public long Timestamp { get; set; }
++    }
++
++    private class DiscoveredRoom
++    {
++        public RoomInfo Info { get; set; }
++        public DateTime LastSeen { get; set; }
++    }
++
++    /// <summary>
++    /// Starts broadcasting room information as a host.
++    /// </summary>
++    public void StartBroadcasting(ushort gamePort, int currentPlayers, int maxPlayers, string gameMode)
++    {
++        try
++        {
++            _cancellationSource = new CancellationTokenSource();
++            var hostName = GetDeviceName();
++            var localIp = GetPrimaryLocalIpAddress();
++
++            _broadcastTask = Task.Run(async () =>
++            {
++                try
++                {
++                    _broadcastClient = new UdpClient();
++                    _broadcastClient.EnableBroadcast = true;
++
++                    var roomInfo = new RoomInfo
++                    {
++                        HostName = hostName,
++                        HostIpAddress = localIp,
++                        GamePort = gamePort,
++                        CurrentPlayers = currentPlayers,
++                        MaxPlayers = maxPlayers,
++                        GameMode = gameMode ?? "Standard"
++                    };
++
++                    PatchHelper.Log($"LAN discovery: Broadcasting room on port {DiscoveryPort}, game port {gamePort}");
++
++                    while (!_cancellationSource.Token.IsCancellationRequested)
++                    {
++                        try
++                        {
++                            roomInfo.Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
++                            var message = SerializeRoomInfo(roomInfo);
++                            var data = Encoding.UTF8.GetBytes(message);
++
++                            // Broadcast to subnet
++                            await _broadcastClient.SendAsync(data, data.Length, 
++                                new IPEndPoint(IPAddress.Broadcast, DiscoveryPort));
++
++                            await Task.Delay(BroadcastIntervalMs, _cancellationSource.Token);
++                        }
++                        catch (OperationCanceledException)
++                        {
++                            break;
++                        }
++                        catch (Exception ex)
++                        {
++                            PatchHelper.Log($"LAN discovery broadcast error: {ex.Message}");
++                        }
++                    }
++                }
++                finally
++                {
++                    _broadcastClient?.Dispose();
++                }
++            }, _cancellationSource.Token);
++        }
++        catch (Exception ex)
++        {
++            PatchHelper.Log($"Failed to start LAN room broadcasting: {ex}");
++        }
++    }
++
++    /// <summary>
++    /// Starts listening for room broadcasts.
++    /// </summary>
++    public void StartListening()
++    {
++        try
++        {
++            AcquireMulticastLock();
++            _cancellationSource = new CancellationTokenSource();
++
++            _listenerTask = Task.Run(async () =>
++            {
++                try
++                {
++                    _listenerClient = new UdpClient();
++                    _listenerClient.ExclusiveAddressUse = false;
++                    _listenerClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
++                    _listenerClient.Client.Bind(new IPEndPoint(IPAddress.Any, DiscoveryPort));
++
++                    PatchHelper.Log($"LAN discovery: Listening for rooms on port {DiscoveryPort}");
++
++                    while (!_cancellationSource.Token.IsCancellationRequested)
++                    {
++                        try
++                        {
++                            var result = await _listenerClient.ReceiveAsync();
++                            var message = Encoding.UTF8.GetString(result.Buffer);
++                            
++                            if (TryDeserializeRoomInfo(message, out var roomInfo))
++                            {
++                                // Validate the room isn't from ourselves
++                                if (!IsLocalAddress(roomInfo.HostIpAddress))
++                                {
++                                    var roomKey = $"{roomInfo.HostIpAddress}:{roomInfo.GamePort}";
++                                    lock (_roomsLock)
++                                    {
++                                        _discoveredRooms[roomKey] = new DiscoveredRoom
++                                        {
++                                            Info = roomInfo,
++                                            LastSeen = DateTime.UtcNow
++                                        };
++                                    }
++                                }
++                            }
++
++                            // Clean up expired rooms
++                            CleanupExpiredRooms();
++                        }
++                        catch (OperationCanceledException)
++                        {
++                            break;
++                        }
++                        catch (Exception ex)
++                        {
++                            PatchHelper.Log($"LAN discovery listener error: {ex.Message}");
++                        }
++                    }
++                }
++                finally
++                {
++                    _listenerClient?.Dispose();
++                }
++            }, _cancellationSource.Token);
++        }
++        catch (Exception ex)
++        {
++            PatchHelper.Log($"Failed to start LAN room listening: {ex}");
++        }
++    }
++
++    /// <summary>
++    /// Gets the list of currently discovered rooms.
++    /// </summary>
++    public List<RoomInfo> GetDiscoveredRooms()
++    {
++        lock (_roomsLock)
++        {
++            CleanupExpiredRooms();
++            return _discoveredRooms.Values
++                .Select(r => r.Info)
++                .OrderByDescending(r => r.Timestamp)
++                .ToList();
++        }
++    }
++
++    /// <summary>
++    /// Stops broadcasting and/or listening.
++    /// </summary>
++    public void Stop()
++    {
++        _cancellationSource?.Cancel();
++        _broadcastTask?.Wait(TimeSpan.FromSeconds(1));
++        _listenerTask?.Wait(TimeSpan.FromSeconds(1));
++        ReleaseMulticastLock();
++    }
++
++    public void Dispose()
++    {
++        Stop();
++        _cancellationSource?.Dispose();
++        _broadcastClient?.Dispose();
++        _listenerClient?.Dispose();
++    }
++
++    private void CleanupExpiredRooms()
++    {
++        lock (_roomsLock)
++        {
++            var expiredTime = DateTime.UtcNow.AddMilliseconds(-RoomTimeoutMs);
++            var expiredKeys = _discoveredRooms
++                .Where(kvp => kvp.Value.LastSeen < expiredTime)
++                .Select(kvp => kvp.Key)
++                .ToList();
++
++            foreach (var key in expiredKeys)
++            {
++                _discoveredRooms.Remove(key);
++            }
++        }
++    }
++
++    private string SerializeRoomInfo(RoomInfo roomInfo)
++    {
++        var json = JsonSerializer.Serialize(roomInfo);
++        return $"{DiscoveryMagic}|{json}";
++    }
++
++    private bool TryDeserializeRoomInfo(string message, out RoomInfo roomInfo)
++    {
++        roomInfo = null;
++        try
++        {
++            if (!message.StartsWith(DiscoveryMagic + "|"))
++                return false;
++
++            var json = message.Substring(DiscoveryMagic.Length + 1);
++            roomInfo = JsonSerializer.Deserialize<RoomInfo>(json);
++            return roomInfo != null;
++        }
++        catch
++        {
++            return false;
++        }
++    }
++
++    private string GetDeviceName()
++    {
++        try
++        {
++            var build = Java.Lang.Class.ForName("android.os.Build");
++            var modelField = build.GetField("MODEL");
++            var model = modelField.Get(null)?.ToString() ?? "Android";
++            return model;
++        }
++        catch
++        {
++            return "Android Device";
++        }
++    }
++
++    private string GetPrimaryLocalIpAddress()
++    {
++        try
++        {
++            var addresses = LanMultiplayerPatches.GetLocalIpv4Addresses();
++            return addresses.FirstOrDefault() ?? "127.0.0.1";
++        }
++        catch
++        {
++            return "127.0.0.1";
++        }
++    }
++
++    private bool IsLocalAddress(string ipAddress)
++    {
++        try
++        {
++            var addresses = LanMultiplayerPatches.GetLocalIpv4Addresses();
++            return addresses.Contains(ipAddress);
++        }
++        catch
++        {
++            return false;
++        }
++    }
++
++    private void AcquireMulticastLock()
++    {
++        try
++        {
++            var context = Android.App.Application.Context;
++            var wifiManager = context.GetSystemService(Android.Content.Context.WifiService) as Android.Net.Wifi.WifiManager;
++            if (wifiManager != null)
++            {
++                _multicastLock = wifiManager.CreateMulticastLock("sts2_lan_discovery");
++                if (_multicastLock != null)
++                {
++                    var method = _multicastLock.GetType().GetMethod("acquire", new Type[0]);
++                    method?.Invoke(_multicastLock, null);
++                    PatchHelper.Log("LAN discovery: Acquired multicast lock");
++                }
++            }
++        }
++        catch (Exception ex)
++        {
++            PatchHelper.Log($"Failed to acquire multicast lock: {ex.Message}");
++        }
++    }
++
++    private void ReleaseMulticastLock()
++    {
++        try
++        {
++            if (_multicastLock != null)
++            {
++                var method = _multicastLock.GetType().GetMethod("release", new Type[0]);
++                method?.Invoke(_multicastLock, null);
++                _multicastLock = null;
++                PatchHelper.Log("LAN discovery: Released multicast lock");
++            }
++        }
++        catch (Exception ex)
++        {
++            PatchHelper.Log($"Failed to release multicast lock: {ex.Message}");
++        }
++    }
++}
+-- 
+2.43.0
+
